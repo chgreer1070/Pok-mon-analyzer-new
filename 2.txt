@@ -1,0 +1,383 @@
+import cv2
+import numpy as np
+import streamlit as st
+from PIL import Image
+
+# -----------------------------------------------------------------------------
+# --- Core Card Analysis Logic (from our previous script) ---
+# -----------------------------------------------------------------------------
+
+def analyze_centering(img_gray, img_color, thresholds):
+    """
+    Finds the two largest contours (outer card and inner artwork box)
+    and calculates centering.
+    """
+    st.write("Step 1: Analyzing Centering...")
+    
+    # Pre-process for contour detection
+    blur = cv2.GaussianBlur(img_gray, (7, 7), 0)
+    edges = cv2.Canny(blur, thresholds[0], thresholds[1])
+
+    # Find all contours
+    contours, _ = cv2.findContours(edges.copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+    if len(contours) < 2:
+        st.error(
+            "Centering Error: Could not find at least two contours.\n"
+            "Try adjusting the 'Centering Canny Thresholds' in the sidebar, "
+            "or use a scan with a plainer, high-contrast background."
+        )
+        return None, None, None, None
+
+    # Sort by area, largest to smallest
+    sorted_contours = sorted(contours, key=cv2.contourArea, reverse=True)
+
+    # Get the bounding boxes
+    outer_box = cv2.boundingRect(sorted_contours[0])
+    inner_box = cv2.boundingRect(sorted_contours[1])
+
+    x_o, y_o, w_o, h_o = outer_box
+    x_i, y_i, w_i, h_i = inner_box
+
+    # Sanity check: ensure inner box is smaller than outer box
+    if not (w_i < w_o and h_i < h_o):
+        st.error(
+            "Centering Error: Detected artwork box is larger than the card.\n"
+            "This is likely due to complex background noise. "
+            "Try adjusting 'Centering Canny Thresholds'."
+        )
+        return None, None, None, None
+
+    # Calculate border dimensions
+    left_border = x_i - x_o
+    right_border = (x_o + w_o) - (x_i + w_i)
+    top_border = y_i - y_o
+    bottom_border = (y_o + h_o) - (y_i + h_i)
+    
+    total_horizontal = left_border + right_border
+    total_vertical = top_border + bottom_border
+
+    if total_horizontal <= 0 or total_vertical <= 0:
+        st.error(
+            "Centering Error: Could not calculate centering. Borders have zero width."
+        )
+        return None, None, None, None
+
+    # Calculate percentages
+    left_percent = (left_border / total_horizontal) * 100
+    right_percent = (right_border / total_horizontal) * 100
+    top_percent = (top_border / total_vertical) * 100
+    bottom_percent = (bottom_border / total_vertical) * 100
+
+    # Draw boxes on the visualization image
+    viz_image = img_color.copy()
+    cv2.rectangle(viz_image, (x_o, y_o), (x_o + w_o, y_o + h_o), (0, 255, 0), 3) # Green outer
+    cv2.rectangle(viz_image, (x_i, y_i), (x_i + w_i, y_i + h_i), (0, 0, 255), 3) # Red inner
+
+    report = (
+        f"  - **Horizontal (L/R):** `{left_percent:.2f}% / {right_percent:.2f}%`\n"
+        f"  - **Vertical (T/B):** `{top_percent:.2f}% / {bottom_percent:.2f}%`"
+    )
+    
+    st.write("  ✅ Centering analysis complete.")
+    return report, outer_box, inner_box, viz_image
+
+def analyze_edge_wear(img_color, outer_box, inner_box, card_side, hsv_config):
+    """
+    Analyzes the border area for pixels that are NOT the correct
+    card border color (e.g., detects white or silver specks).
+    """
+    st.write("Step 2: Analyzing Edge Wear (Whitening)...")
+    
+    x_o, y_o, w_o, h_o = outer_box
+    x_i, y_i, w_i, h_i = inner_box
+
+    # Create a black image (mask) of the full card size
+    outer_mask = np.zeros(img_color.shape[:2], dtype="uint8")
+    cv2.rectangle(outer_mask, (x_o, y_o), (x_o + w_o, y_o + h_o), 255, -1)
+
+    # Create a black mask of the inner artwork box
+    inner_mask = np.zeros(img_color.shape[:2], dtype="uint8")
+    cv2.rectangle(inner_mask, (x_i, y_i), (x_i + w_i, y_i + h_i), 255, -1)
+
+    # The border mask is the outer mask MINUS the inner mask
+    border_mask = cv2.subtract(outer_mask, inner_mask)
+
+    # Get the total number of pixels in the border
+    total_border_pixels = cv2.countNonZero(border_mask)
+    if total_border_pixels == 0:
+        st.error("Edge Wear Error: No border pixels found.")
+        return "N/A", None
+
+    # Convert the whole image to HSV color space
+    hsv_img = cv2.cvtColor(img_color, cv2.COLOR_BGR2HSV)
+
+    # Select the correct color range based on the CARD_SIDE config
+    if card_side == 'Front':
+        lower_hsv = np.array(hsv_config['front_lower'])
+        upper_hsv = np.array(hsv_config['front_upper'])
+    else: # 'Back'
+        lower_hsv = np.array(hsv_config['back_lower'])
+        upper_hsv = np.array(hsv_config['back_upper'])
+
+    # Create a mask of all "good" (correctly colored) pixels
+    good_color_mask = cv2.inRange(hsv_img, lower_hsv, upper_hsv)
+
+    # A "defect" is a pixel that is:
+    # 1. In the border area (from border_mask)
+    # 2. NOT the correct color (by inverting good_color_mask)
+    defect_mask = cv2.bitwise_and(border_mask, cv2.bitwise_not(good_color_mask))
+
+    # Calculate defect percentage
+    defect_pixels = cv2.countNonZero(defect_mask)
+    defect_percentage = (defect_pixels / total_border_pixels) * 100
+
+    report = (
+        f"  - **Defect Level:** `{defect_percentage:.4f}%`\n"
+        f"  - **Defect Pixels:** `{defect_pixels}` (out of {total_border_pixels} border pixels)"
+    )
+    st.write("  ✅ Edge wear analysis complete.")
+    return report, defect_mask
+
+def analyze_surface(img_gray, img_color, inner_box, viz_image, surface_config):
+    """
+    Analyzes the inner artwork box for:
+    1. Print Lines (Hough Line Transform)
+    2. Surface Scuffs (Laplacian Variance)
+    """
+    st.write("Step 3: Analyzing Surface (Print Lines & Scuffs)...")
+    
+    x_i, y_i, w_i, h_i = inner_box
+
+    # Crop the image to *only* the inner artwork box
+    artwork_crop_gray = img_gray[y_i:y_i+h_i, x_i:x_i+w_i]
+    
+    if artwork_crop_gray.size == 0:
+        st.error("Surface Error: Artwork crop is empty.")
+        return "N/A", "N/A"
+
+    # --- Part 1: Print Line Detection ---
+    edges = cv2.Canny(
+        artwork_crop_gray, 
+        surface_config['canny_low'], 
+        surface_config['canny_high']
+    )
+    
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=surface_config['hough_thresh'],
+        minLineLength=surface_config['hough_min_len'],
+        maxLineGap=surface_config['hough_max_gap']
+    )
+
+    line_count = 0
+    if lines is not None:
+        line_count = len(lines)
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            # Draw the detected line on the main visualization image
+            # (Remember to add the inner_box offset)
+            cv2.line(viz_image, (x1 + x_i, y1 + y_i), (x2 + x_i, y2 + y_i), (255, 0, 0), 2) # Blue lines
+    
+    line_report = f"  - **Print Lines:** `{line_count}` significant lines detected"
+
+    # --- Part 2: Surface Scuff/Texture Analysis ---
+    laplacian_var = cv2.Laplacian(artwork_crop_gray, cv2.CV_64F).var()
+    
+    scuff_report = (
+        f"  - **Holo Scuff Variance:** `{laplacian_var:.2f}`\n"
+        "    *(Low = Smooth, High = Textured/Scratched. "
+        "Compare to a known mint card.)*"
+    )
+    
+    st.write("  ✅ Surface analysis complete.")
+    return line_report, scuff_report
+
+# -----------------------------------------------------------------------------
+# --- Streamlit Web Application (UI) ---
+# -----------------------------------------------------------------------------
+
+st.set_page_config(page_title="Pokémon Card Analyzer", layout="wide")
+st.title("🤖 AI-Assisted Pokémon Card Analyzer")
+
+st.info(
+    "**Welcome!** This tool analyzes a high-resolution scan of your card for "
+    "Centering, Edge Wear, and Surface Flaws. \n\n"
+    "**Instructions:**\n"
+    "1.  Upload a high-resolution, flatbed scan of your card (PNG or JPG).\n"
+    "2.  Select the **Card Side** ('Front' or 'Back') in the sidebar.\n"
+    "3.  (Optional) Adjust the 'Advanced Settings' sliders to tune the analysis.\n"
+    "4.  Click the 'Analyze Card' button!"
+)
+
+# --- Sidebar (Settings) ---
+
+st.sidebar.title("Settings")
+uploaded_file = st.sidebar.file_uploader(
+    "1. Upload Card Scan", 
+    type=["png", "jpg", "jpeg"]
+)
+card_side = st.sidebar.selectbox("2. Select Card Side", ('Front', 'Back'))
+
+# --- Advanced Settings (Collapsible) ---
+with st.sidebar.expander("Advanced Settings (Tuning)"):
+    st.write("Adjust these if the analysis is inaccurate.")
+    
+    # Centering Settings
+    st.subheader("Centering")
+    centering_canny = st.slider(
+        "Centering Canny Thresholds",
+        0, 500, (50, 150),
+        help="Finds the main card edges. Widen range (e.g., 20-200) if "
+             "edges aren't found. Narrow (e.g., 100-200) if it "
+             "picks up background noise."
+    )
+    
+    # Edge Wear Settings
+    st.subheader("Edge Wear (HSV)")
+    st.write("Front Border (Yellow)")
+    front_lower_hsv = st.slider("Lower Yellow (H, S, V)", 0, 255, (20, 100, 100))
+    front_upper_hsv = st.slider("Upper Yellow (H, S, V)", 0, 255, (30, 255, 255))
+    
+    st.write("Back Border (Blue)")
+    back_lower_hsv = st.slider("Lower Blue (H, S, V)", 0, 255, (90, 80, 50))
+    back_upper_hsv = st.slider("Upper Blue (H, S, V)", 0, 255, (130, 255, 255))
+    
+    hsv_config = {
+        'front_lower': front_lower_hsv,
+        'front_upper': front_upper_hsv,
+        'back_lower': back_lower_hsv,
+        'back_upper': back_upper_hsv,
+    }
+
+    # Surface Settings
+    st.subheader("Surface & Print Lines")
+    surface_canny = st.slider(
+        "Surface Canny Thresholds",
+        0, 500, (100, 200),
+        help="Finds edges *within* the artwork. "
+             "Increase to find only very sharp lines."
+    )
+    hough_thresh = st.slider(
+        "Hough Threshold", 10, 200, 50,
+        help="How many 'votes' are needed to detect a line."
+    )
+    hough_min_len = st.slider(
+        "Hough Min Line Length (px)", 10, 1000, 150,
+        help="The shortest line to report as a 'print line'."
+    )
+    hough_max_gap = st.slider(
+        "Hough Max Line Gap (px)", 0, 100, 20,
+        help="Max gap to connect two segments into one line."
+    )
+    
+    surface_config = {
+        'canny_low': surface_canny[0],
+        'canny_high': surface_canny[1],
+        'hough_thresh': hough_thresh,
+        'hough_min_len': hough_min_len,
+        'hough_max_gap': hough_max_gap,
+    }
+
+# --- Main Analysis Button & Output ---
+
+if uploaded_file is not None:
+    if st.button("Analyze Card", type="primary", use_container_width=True):
+        
+        # Load the image with PIL and convert to OpenCV format
+        image = Image.open(uploaded_file)
+        img_color = np.array(image)
+        # Convert RGB (from PIL) to BGR (for OpenCV)
+        img_color = cv2.cvtColor(img_color, cv2.COLOR_RGB2BGR)
+        img_gray = cv2.cvtColor(img_color, cv2.COLOR_BGR2GRAY)
+
+        st.success(f"Successfully loaded '{uploaded_file.name}'. Starting analysis...")
+        
+        # --- Run Full Pipeline ---
+        with st.spinner('Analyzing... This may take a moment...'):
+            centering_report, outer_box, inner_box, viz_image = analyze_centering(
+                img_gray, img_color, centering_canny
+            )
+            
+            # These reports will be built as we go
+            edge_wear_report = "Analysis Skipped (Centering Failed)"
+            line_report = "Analysis Skipped (Centering Failed)"
+            scuff_report = "Analysis Skipped (Centering Failed)"
+            defect_mask = None
+
+            if centering_report is not None:
+                edge_wear_report, defect_mask = analyze_edge_wear(
+                    img_color, outer_box, inner_box, card_side, hsv_config
+                )
+                
+                line_report, scuff_report = analyze_surface(
+                    img_gray, img_color, inner_box, viz_image, surface_config
+                )
+        
+        st.balloons()
+        st.header("Analysis Complete")
+        
+        # --- Display Final Report ---
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("📊 Final Report")
+            st.markdown("#### 1. Centering")
+            if centering_report:
+                st.markdown(centering_report)
+            
+            st.markdown("#### 2. Edge Wear (Whitening/Silvering)")
+            st.markdown(edge_wear_report)
+            
+            st.markdown("#### 3. Surface Analysis (Artwork Box)")
+            st.markdown(line_report)
+            st.markdown(scuff_report)
+
+        with col2:
+            st.subheader("🖼️ Visualization")
+            if viz_image is not None:
+                # Convert BGR (OpenCV) back to RGB (Streamlit)
+                st.image(
+                    cv2.cvtColor(viz_image, cv2.COLOR_BGR2RGB),
+                    caption="Analysis Visualization",
+                    use_column_width=True
+                )
+                st.markdown(
+                    "- **Green Box:** Detected outer card edge.\n"
+                    "- **Red Box:** Detected inner artwork edge.\n"
+                    "- **Blue Lines:** Detected print lines."
+                )
+            
+            if defect_mask is not None:
+                st.subheader("Tune: Edge Defect Mask")
+                st.image(
+                    defect_mask, 
+                    caption="Edge Wear Defect Mask",
+                    use_column_width=True
+                )
+                st.warning(
+                    "**How to Tune:** The white pixels above are what the "
+                    "script 'thinks' is a defect. If the whole border is "
+                    "white (or black), adjust the 'Edge Wear (HSV)' sliders "
+                    "in the sidebar until *only* the white specks are visible."
+                )
+
+else:
+    st.warning("Please upload a card scan to begin.")
+
+🚀 How to Begin Using Your Tool (3 Steps)
+You no longer need to edit any code. Just follow these steps:
+Step 1: Install the Required Libraries
+Open your terminal or command prompt and run these two commands:
+pip install streamlit
+pip install opencv-python-headless
+
+(You may already have opencv-python-headless from our last script, but streamlit is new.)
+Step 2: Save the File
+Save the code I provided above in a file named card_analyzer_app.py.
+Step 3: Run the App
+In the same terminal, navigate to the folder where you saved the file and run this simple command:
+streamlit run card_analyzer_app.py
+
