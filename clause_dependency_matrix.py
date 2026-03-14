@@ -14,7 +14,9 @@ populated.
 
 from __future__ import annotations
 
+import argparse
 from dataclasses import dataclass, field
+import json
 import re
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -72,6 +74,50 @@ class ClauseDependencyMatrix:
             numeric = "  ".join(f"{value:>2}" for value in self.matrix[idx])
             rows.append(f"C{idx}: {numeric}  | {clause.text}")
         return "\n".join(rows)
+
+    def strongest_relations(self, limit: int = 5) -> List[Tuple[int, int, str, int]]:
+        """Return strongest relations sorted by weight descending.
+
+        Parameters
+        ----------
+        limit:
+            Maximum number of relations to include in the result.
+        """
+
+        ranked: List[Tuple[int, int, str, int]] = []
+        for (origin, target), relation in self.relations.items():
+            ranked.append((origin, target, relation, self.matrix[origin][target]))
+        ranked.sort(key=lambda item: (item[3], -item[0], -item[1]), reverse=True)
+        return ranked[:limit]
+
+    def to_dict(self) -> Dict[str, object]:
+        """Serialize the matrix and metadata to a JSON-friendly dictionary."""
+
+        return {
+            "clauses": [
+                {"index": clause.index, "text": clause.text, "trigger": clause.trigger}
+                for clause in self.clauses
+            ],
+            "matrix": self.matrix,
+            "relations": [
+                {
+                    "origin": origin,
+                    "target": target,
+                    "relation": relation,
+                    "weight": self.matrix[origin][target],
+                }
+                for (origin, target), relation in sorted(self.relations.items())
+            ],
+            "top_relations": [
+                {
+                    "origin": origin,
+                    "target": target,
+                    "relation": relation,
+                    "weight": weight,
+                }
+                for origin, target, relation, weight in self.strongest_relations()
+            ],
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +300,62 @@ def build_clause_dependency_matrix(text: str) -> ClauseDependencyMatrix:
     return ClauseDependencyMatrix(clauses=clauses, matrix=matrix, relations=relations)
 
 
+def summarize_dependencies(matrix: ClauseDependencyMatrix, top_n: int = 5) -> str:
+    """Return a concise natural-language summary for a matrix result."""
+
+    if not matrix.clauses:
+        return "No clauses were detected."
+
+    clause_count = len(matrix.clauses)
+    relation_count = len(matrix.relations)
+    summary_lines = [
+        f"Detected {clause_count} clauses and {relation_count} directed relations.",
+    ]
+
+    ranked = matrix.strongest_relations(limit=top_n)
+    if ranked:
+        summary_lines.append("Strongest inferred dependencies:")
+        for origin, target, relation, weight in ranked:
+            origin_text = matrix.clauses[origin].text
+            target_text = matrix.clauses[target].text
+            summary_lines.append(
+                f"- C{origin} → C{target}: {relation} (weight {weight}) "
+                f"[{origin_text!r} -> {target_text!r}]"
+            )
+    else:
+        summary_lines.append("No explicit dependency triggers were identified.")
+
+    return "\n".join(summary_lines)
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Build a clause dependency matrix from text.")
+    parser.add_argument("--text", help="Raw text to analyze.")
+    parser.add_argument("--file", help="Path to a UTF-8 text file to analyze.")
+    parser.add_argument(
+        "--format",
+        choices=("pretty", "json"),
+        default="pretty",
+        help="Output format.",
+    )
+    parser.add_argument(
+        "--top",
+        type=int,
+        default=5,
+        help="Number of strongest relations to include in summaries.",
+    )
+    return parser.parse_args()
+
+
+def _load_input_text(args: argparse.Namespace) -> str:
+    if args.text:
+        return args.text
+    if args.file:
+        with open(args.file, "r", encoding="utf-8") as handle:
+            return handle.read()
+    raise ValueError("You must provide either --text or --file.")
+
+
 def _demo() -> None:
     sample_text = (
         "Although the forecast predicted sunshine, the sky darkened quickly, "
@@ -268,8 +370,23 @@ def _demo() -> None:
     print("\nRelations:")
     for (origin, target), relation in sorted(matrix.relations.items()):
         print(f"C{origin} -> C{target}: {relation}")
+    print("\nSummary:")
+    print(summarize_dependencies(matrix))
+
+
+def _main() -> None:
+    args = _parse_args()
+    text = _load_input_text(args)
+    matrix = build_clause_dependency_matrix(text)
+    if args.format == "json":
+        payload = matrix.to_dict()
+        payload["summary"] = summarize_dependencies(matrix, top_n=args.top)
+        print(json.dumps(payload, indent=2))
+        return
+
+    print(matrix.pretty_print())
+    print("\n" + summarize_dependencies(matrix, top_n=args.top))
 
 
 if __name__ == "__main__":  # pragma: no cover - manual demonstration helper
-    _demo()
-
+    _main()
